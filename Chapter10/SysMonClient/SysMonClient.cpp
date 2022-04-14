@@ -21,6 +21,39 @@ void DisplayTime(const LARGE_INTEGER& time) {
 	printf("%02d:%02d:%02d.%03d: ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 }
 
+void DisplayBinary(const BYTE* buffer, DWORD size) {
+	printf("\n");
+	for (DWORD i = 0; i < size; i++) {
+		printf("%02X ", buffer[i]);
+		//
+		// go to new line every 16 values
+		//
+		if ((i + 1) % 16 == 0)
+			printf("\n");
+	}
+	printf("\n");
+}
+
+void DisplayRegistryValue(const RegistrySetValueInfo* info) {
+	auto data = (PBYTE)info + info->DataOffset;
+	switch (info->DataType) {
+		case REG_DWORD:
+			printf("0x%08X (%u)\n", *(DWORD*)data, *(DWORD*)data);
+			break;
+
+		case REG_SZ:
+		case REG_EXPAND_SZ:
+			printf("%ws\n", (PCWSTR)data);
+			break;
+
+			// add other cases... (REG_QWORD, REG_LINK, etc.)
+
+		default:
+			DisplayBinary(data, info->ProvidedDataSize);
+			break;
+	}
+}
+
 std::wstring GetDosNameFromNTName(PCWSTR path) {
 	if (path[0] != L'\\')
 		return path;
@@ -103,6 +136,18 @@ void DisplayInfo(BYTE* buffer, DWORD size) {
 				auto info = (ImageLoadInfo*)buffer;
 				printf("Image loaded into process %u at address 0x%llX (%ws)\n", 
 					info->ProcessId, info->LoadAddress, GetDosNameFromNTName(info->ImageFileName).c_str());
+				break;
+			}
+
+			case ItemType::RegistrySetValue:
+			{
+				DisplayTime(header->Time);
+				auto info = (RegistrySetValueInfo*)buffer;
+				printf("Registry write PID=%u, TID=%u: %ws\\%ws type: %d size: %d data: ", 
+					info->ProcessId, info->ThreadId,
+					 (PCWSTR)((PBYTE)info + info->KeyNameOffset), (PCWSTR)((PBYTE)info + info->ValueNameOffset),
+					info->DataType, info->DataSize);
+				DisplayRegistryValue(info);
 				break;
 			}
 
