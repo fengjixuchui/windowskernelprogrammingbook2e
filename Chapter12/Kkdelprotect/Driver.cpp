@@ -8,20 +8,23 @@ NTSTATUS OnCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp);
 NTSTATUS OnDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp);
 NTSTATUS InitMiniFilter(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
 
-extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
-	auto status = InitMiniFilter(DriverObject, RegistryPath);
-	if (!NT_SUCCESS(status)) {
-		KdPrint((DRIVER_PREFIX "Failed to init mini-filter (0x%X)\n", status));
+FilterState g_State;
+
+extern "C" 
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+	auto status = g_State.Lock.Init();
+	if (!NT_SUCCESS(status))
 		return status;
-	}
 
-	g_State.Lock.Init();
-
+	UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\DelProtect");
 	PDEVICE_OBJECT devObj = nullptr;
+	bool symLinkCreated = false;
 	do {
-		status = FltStartFiltering(g_State.Filter);
-		if (!NT_SUCCESS(status))
+		status = InitMiniFilter(DriverObject, RegistryPath);
+		if (!NT_SUCCESS(status)) {
+			KdPrint((DRIVER_PREFIX "Failed to init mini-filter (0x%X)\n", status));
 			break;
+		}
 
 		UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\DelProtect");
 		status = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN, 0, FALSE, &devObj);
@@ -30,17 +33,24 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 			break;
 		}
 
-		UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\DelProtect");
 		status = IoCreateSymbolicLink(&symLink, &devName);
 		if (!NT_SUCCESS(status)) {
 			KdPrint(("Failed to create symbolic link (0x%08X)\n", status));
 			break;
 		}
+		symLinkCreated = true;
+		status = FltStartFiltering(g_State.Filter);
+		if (!NT_SUCCESS(status))
+			break;
 	} while (false);
 
 	if (!NT_SUCCESS(status)) {
 		KdPrint((DRIVER_PREFIX "Error in DriverEntry: 0x%X\n", status));
-		FltUnregisterFilter(g_State.Filter);
+		g_State.Lock.Delete();
+		if(g_State.Filter)
+			FltUnregisterFilter(g_State.Filter);
+		if (symLinkCreated)
+			IoDeleteSymbolicLink(&symLink);
 		if (devObj)
 			IoDeleteDevice(devObj);
 		return status;
@@ -77,25 +87,38 @@ NTSTATUS OnDeviceControl(PDEVICE_OBJECT, PIRP Irp) {
 	switch (dic.IoControlCode) {
 		case IOCTL_DELPROTECT_SET_EXTENSIONS:
 			auto ext = (WCHAR*)Irp->AssociatedIrp.SystemBuffer;
-			if (ext == nullptr || dic.InputBufferLength < sizeof(WCHAR) * 2 || ext[dic.InputBufferLength / sizeof(WCHAR) - 1] != 0) {
+			auto inputLen = dic.InputBufferLength;
+			if (ext == nullptr || inputLen < sizeof(WCHAR) * 2 ||
+				ext[inputLen / sizeof(WCHAR) - 1] != 0) {
 				status = STATUS_INVALID_PARAMETER;
 				break;
 			}
-			if (g_State.Extentions.MaximumLength < dic.InputBufferLength - sizeof(WCHAR)) {
-				auto buffer = ExAllocatePool2(POOL_FLAG_PAGED | POOL_FLAG_UNINITIALIZED, dic.InputBufferLength, DRIVER_TAG);
+			if (g_State.Extentions.MaximumLength <
+				inputLen - sizeof(WCHAR)) {
+				//
+				// allocate a new buffer to hold the extensions
+				//
+				auto buffer = ExAllocatePool2(POOL_FLAG_PAGED,
+					inputLen, DRIVER_TAG);
 				if (buffer == nullptr) {
 					status = STATUS_INSUFFICIENT_RESOURCES;
 					break;
 				}
-				g_State.Extentions.MaximumLength = (USHORT)dic.InputBufferLength;
+				g_State.Extentions.MaximumLength = (USHORT)inputLen;
+				//
+				// free the old buffer
+				//
 				ExFreePool(g_State.Extentions.Buffer);
 				g_State.Extentions.Buffer = (PWSTR)buffer;
 			}
 			UNICODE_STRING ustr;
 			RtlInitUnicodeString(&ustr, ext);
+			//
+			// make sure the extensions are uppercase
+			//
 			RtlUpcaseUnicodeString(&ustr, &ustr, FALSE);
-			memcpy(g_State.Extentions.Buffer, ext, len = dic.InputBufferLength);
-			g_State.Extentions.Length = (USHORT)dic.InputBufferLength;
+			memcpy(g_State.Extentions.Buffer, ext, len = inputLen);
+			g_State.Extentions.Length = (USHORT)inputLen;
 			status = STATUS_SUCCESS;
 			break;
 	}
