@@ -3,8 +3,6 @@
 #include "Driver.h"
 #include <Locker.h>
 
-FilterState* g_State;
-
 NTSTATUS HideUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags);
 NTSTATUS HideInstanceSetup(
 	_In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -117,6 +115,12 @@ NTSTATUS HideUnload(FLT_FILTER_UNLOAD_FLAGS Flags) {
 	UNREFERENCED_PARAMETER(Flags);
 
 	FltUnregisterFilter(g_State->Filter);
+
+	UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\??\\Hide");
+	IoDeleteSymbolicLink(&symLink);
+	IoDeleteDevice(g_State->DriverObject->DeviceObject);
+	delete g_State;
+
 	return STATUS_SUCCESS;
 }
 
@@ -151,7 +155,9 @@ VOID HideInstanceTeardownComplete(PCFLT_RELATED_OBJECTS FltObjects, FLT_INSTANCE
 FLT_POSTOP_CALLBACK_STATUS OnPostDirectoryControl(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects, PVOID, FLT_POST_OPERATION_FLAGS flags) {
 	UNREFERENCED_PARAMETER(FltObjects);
 
-	if (Data->Iopb->MinorFunction != IRP_MN_QUERY_DIRECTORY || (flags & FLTFL_POST_OPERATION_DRAINING))
+	if (Data->RequestorMode == KernelMode ||
+		Data->Iopb->MinorFunction != IRP_MN_QUERY_DIRECTORY ||
+		(flags & FLTFL_POST_OPERATION_DRAINING))
 		return FLT_POSTOP_FINISHED_PROCESSING;
 
 	auto& params = Data->Iopb->Parameters.DirectoryControl.QueryDirectory;
@@ -160,11 +166,14 @@ FLT_POSTOP_CALLBACK_STATUS OnPostDirectoryControl(PFLT_CALLBACK_DATA Data, PCFLT
 		FileFullDirectoryInformationDefinition,
 		FileBothDirectoryInformationDefinition,
 		FileDirectoryInformationDefinition,
+		FileNamesInformationDefinition,
 		FileIdFullDirectoryInformationDefinition,
 		FileIdBothDirectoryInformationDefinition,
+		FileIdExtdDirectoryInformationDefinition,
+		FileIdGlobalTxDirectoryInformationDefinition
 	};
 	const FILE_INFORMATION_DEFINITION* actual = nullptr;
-	for(auto const& def : defs)
+	for (auto const& def : defs)
 		if (def.Class == params.FileInformationClass) {
 			actual = &def;
 			break;
@@ -181,8 +190,23 @@ FLT_POSTOP_CALLBACK_STATUS OnPostDirectoryControl(PFLT_CALLBACK_DATA Data, PCFLT
 	//
 	IoQueryFileDosDeviceName(FltObjects->FileObject, &dosPath);
 	if (dosPath) {
+		PUCHAR base = nullptr;
+		//
+		// use MDL if available
+		//
+		if (params.MdlAddress)
+			base = (PUCHAR)MmGetSystemAddressForMdlSafe(params.MdlAddress, NormalPagePriority);
+		if (!base)
+			base = (PUCHAR)params.DirectoryBuffer;
+		if (base == nullptr) {
+			return FLT_POSTOP_FINISHED_PROCESSING;
+		}
+
 		SharedLocker locker(g_State->Lock);
 		for (auto& name : g_State->Files) {
+			//
+			// look for a backslash so we can remove the final component
+			//
 			auto bs = wcsrchr(name, L'\\');
 			if (bs == nullptr)
 				continue;
@@ -190,69 +214,55 @@ FLT_POSTOP_CALLBACK_STATUS OnPostDirectoryControl(PFLT_CALLBACK_DATA Data, PCFLT
 			UNICODE_STRING copy;
 			copy.Buffer = name.Data();
 			copy.Length = USHORT(bs - name + 1) * sizeof(WCHAR);
-			if (copy.Length == sizeof(WCHAR) * 2)	// Drive+colon only
+			//
+			// copy now points to the parent directory
+			// by making its Length shorter
+			//
+			if (copy.Length == sizeof(WCHAR) * 2)	// Drive+colon only (e.g. C:)
 				copy.Length += sizeof(WCHAR);		// add the backslash
 
 			if (RtlEqualUnicodeString(&copy, &dosPath->Name, TRUE)) {
 				//
 				// parent directory. find last component
 				//
-				PUCHAR base = nullptr;
-				//
-				// use MDL if available
-				//
-				if (params.MdlAddress)
-					base = (PUCHAR)MmGetSystemAddressForMdlSafe(params.MdlAddress, NormalPagePriority);
-				if (!base)
-					base = (PUCHAR)params.DirectoryBuffer;
-				if (base == nullptr) {
-					return FLT_POSTOP_FINISHED_PROCESSING;
-				}
+				ULONG nextOffset = 0;
+				PUCHAR prev = nullptr;
+				auto str = bs + 1;	// the final component beyond the backslash
 
-				__try {
-					ULONG nextOffset = 0;
-					PUCHAR prev = nullptr;
-					auto str = bs + 1;	// the final component beyond the backslash
+				do {
+					//
+					// due to a current bug in the definition of FILE_INFORMATION_DEFINITION
+					// the file name and length offsets are switched in the definitions
+					// of the macros that initialize FILE_INFORMATION_DEFINITION
+					//
+					auto filename = (PCWSTR)(base + actual->FileNameLengthOffset);
+					auto filenameLen = *(PULONG)(base + actual->FileNameOffset);
 
-					do {
+					nextOffset = *(PULONG)(base + actual->NextEntryOffset);
+
+					if (filenameLen && _wcsnicmp(str, filename, filenameLen / sizeof(WCHAR)) == 0) {
 						//
-						// due to a current bug in the definition of FILE_INFORMATION_DEFINITION
-						// the file name and length offsets are switched in the definitions
-						// of the macros that initialize FILE_INFORMATION_DEFINITION
+						// found it! hide it and exit
 						//
-						auto filename = (PCWSTR)(base + actual->FileNameLengthOffset);
-						auto filenameLen = *(PULONG)(base + actual->FileNameOffset);
-
-						nextOffset = *(PULONG)(base + actual->NextEntryOffset);
-
-						if (filenameLen && _wcsnicmp(str, filename, filenameLen / sizeof(WCHAR)) == 0) {
+						if (prev == nullptr) {
 							//
-							// found it! hide it and exit
+							// first entry - move the buffer to the next item
 							//
-							if (prev == nullptr) {
-								//
-								// first entry - move the buffer to the next item
-								//
-								params.DirectoryBuffer = base + nextOffset;
+							params.DirectoryBuffer = base + nextOffset;
 
-								//
-								// notify the Filter Manager
-								//
-								FltSetCallbackDataDirty(Data);
-							}
-							else {
-								*(PULONG)(prev + actual->NextEntryOffset) += nextOffset;
-							}
-							break;
+							//
+							// notify the Filter Manager
+							//
+							FltSetCallbackDataDirty(Data);
 						}
-						prev = base;
-						base += nextOffset;
-					} while (nextOffset != 0);
-				}
-				__except (GetExceptionCode() == STATUS_ACCESS_VIOLATION 
-					? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-					KdPrint((DRIVER_PREFIX "Access Violation!\n"));
-				}
+						else {
+							*(PULONG)(prev + actual->NextEntryOffset) += nextOffset;
+						}
+						break;
+					}
+					prev = base;
+					base += nextOffset;
+				} while (nextOffset != 0);
 				break;
 			}
 		}
@@ -284,7 +294,7 @@ FLT_PREOP_CALLBACK_STATUS OnPreDirectoryControl(PFLT_CALLBACK_DATA Data, PCFLT_R
 				//
 				// found directory. fail request
 				//
-				//KdPrint((DRIVER_PREFIX "Found: %wZ\n", path));
+				KdPrint((DRIVER_PREFIX "Found: %wZ\n", path));
 				Data->IoStatus.Status = STATUS_NOT_FOUND;
 				Data->IoStatus.Information = 0;
 				status = FLT_PREOP_COMPLETE;
